@@ -81,8 +81,9 @@ class DataLoadPreprocess(Dataset):
                     rgb_file.replace('image_02', 'image_03')
                     depth_file.replace('image_02', 'image_03')
             else:
-                rgb_file = sample_path.split()[0][1:]
-                depth_file = sample_path.split()[1][1:]
+                # Remove leading slash from path (filenames_file uses /train/... format)
+                rgb_file = sample_path.split()[0].lstrip('/')
+                depth_file = sample_path.split()[1].lstrip('/')
 
             image_path = os.path.join(self.args.data_path, rgb_file)
             depth_path = os.path.join(self.args.gt_path, depth_file)
@@ -135,12 +136,15 @@ class DataLoadPreprocess(Dataset):
             else:
                 data_path = self.args.data_path
 
-            image_path = os.path.join(data_path, sample_path.split()[0])
+            # Remove leading slash from path (filenames_file uses /train/... or /test/... format)
+            image_relative_path = sample_path.split()[0].lstrip('/')
+            image_path = os.path.join(data_path, image_relative_path)
             image = np.asarray(Image.open(image_path), dtype=np.float32) / 255.0
 
             if self.mode == 'online_eval':
                 gt_path = self.args.gt_path_eval
-                depth_path = os.path.join(gt_path, sample_path.split()[1])
+                depth_relative_path = sample_path.split()[1].lstrip('/')
+                depth_path = os.path.join(gt_path, depth_relative_path)
                 has_valid_depth = False
                 try:
                     depth_gt = Image.open(depth_path)

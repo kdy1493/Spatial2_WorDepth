@@ -2,13 +2,21 @@ import torch
 import os, sys
 import argparse
 import numpy as np
+import yaml
 from tqdm import tqdm
 from tensorboardX import SummaryWriter
 from utils import compute_errors, eval_metrics, block_print, enable_print, convert_arg_line_to_args
 from networks.wordepth import WorDepth
+from dataloaders.dataloader import NewDataLoader
+
+# Global cache for text features
+TEXT_FEAT_CACHE = {}
 
 parser = argparse.ArgumentParser(description='WorDepth PyTorch implementation.', fromfile_prefix_chars='@')
 parser.convert_arg_line_to_args = convert_arg_line_to_args
+
+# Config file argument
+parser.add_argument('--config', type=str, help='path to YAML config file', default=None)
 
 # Overall
 parser.add_argument('--mode',                      type=str,   help='train or test', default='train')
@@ -18,9 +26,9 @@ parser.add_argument('--eval_only',         action='store_true')
 
 # Dataset
 parser.add_argument('--dataset',                   type=str,   help='dataset to train on, kitti or nyu', default='nyu')
-parser.add_argument('--data_path',                 type=str,   help='path to the data', required=True)
-parser.add_argument('--gt_path',                   type=str,   help='path to the groundtruth data', required=True)
-parser.add_argument('--filenames_file',            type=str,   help='path to the filenames text file', required=True)
+parser.add_argument('--data_path',                 type=str,   help='path to the data', required=False)
+parser.add_argument('--gt_path',                   type=str,   help='path to the groundtruth data', required=False)
+parser.add_argument('--filenames_file',            type=str,   help='path to the filenames text file', required=False)
 parser.add_argument('--input_height',              type=int,   help='input height', default=480)
 parser.add_argument('--input_width',               type=int,   help='input width',  default=640)
 parser.add_argument('--max_depth',                 type=float, help='maximum depth in estimation', default=10)
@@ -50,13 +58,14 @@ parser.add_argument('--use_right',                             help='if set, wil
 
 # Multi-gpu training
 parser.add_argument('--num_threads',               type=int,   help='number of threads to use for data loading', default=1)
+parser.add_argument('--gpu_devices',               type=str,   help='gpu devices to use (e.g., "0" or "0,1,2")', default=None)
 
 # Online eval
 parser.add_argument('--eval_before_train',         action='store_true')
 parser.add_argument('--do_online_eval',                        help='if set, perform online eval in every eval_freq steps', action='store_true')
-parser.add_argument('--data_path_eval',            type=str,   help='path to the data for online evaluation', required=False)
-parser.add_argument('--gt_path_eval',              type=str,   help='path to the groundtruth data for online evaluation', required=False)
-parser.add_argument('--filenames_file_eval',       type=str,   help='path to the filenames text file for online evaluation', required=False)
+parser.add_argument('--data_path_eval',            type=str,   help='path to the data for online evaluation', default=None)
+parser.add_argument('--gt_path_eval',              type=str,   help='path to the groundtruth data for online evaluation', default=None)
+parser.add_argument('--filenames_file_eval',       type=str,   help='path to the filenames text file for online evaluation', default=None)
 parser.add_argument('--min_depth_eval',            type=float, help='minimum depth for evaluation', default=1e-3)
 parser.add_argument('--max_depth_eval',            type=float, help='maximum depth for evaluation', default=80)
 parser.add_argument('--eigen_crop',                            help='if set, crops according to Eigen NIPS14', action='store_true')
@@ -72,15 +81,65 @@ parser.add_argument('--alter_prob',            type=float, default=0.5)
 parser.add_argument('--store_freq',            type=int, default=0)
 parser.add_argument('--legacy',             action='store_true', help='keep skip connection in the UNet')
 
+# Relational Loss
+parser.add_argument('--use_relational_loss',   action='store_true', help='use relational depth loss')
+parser.add_argument('--weight_relational',     type=float, default=0.1, help='weight for relational loss')
+parser.add_argument('--relations_dir_train',   type=str, default=None, help='path to relational annotations for training')
+parser.add_argument('--relations_dir_eval',    type=str, default=None, help='path to relational annotations for evaluation')
+parser.add_argument('--margin_rank',           type=float, default=0.1, help='margin for ranking relations')
+parser.add_argument('--margin_occ',            type=float, default=0.3, help='margin for occlusion relations')
+parser.add_argument('--lambda_occ',            type=float, default=1.5, help='weight for occlusion relations')
+parser.add_argument('--use_median_depth',      action='store_true', help='use median instead of mean for object depth')
 
+
+def load_config(config_path):
+    """Load configuration from YAML file"""
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
+    return config
+
+
+def merge_config_with_args(config, args):
+    """Merge YAML config with command line arguments"""
+    if config is None:
+        return args
+    
+    # Convert config dict to argparse Namespace and merge
+    for key, value in config.items():
+        if not hasattr(args, key) or getattr(args, key) is None or getattr(args, key) == parser.get_default(key):
+            setattr(args, key, value)
+    
+    return args
+
+
+# Parse arguments
 if sys.argv.__len__() == 2:
-    arg_filename_with_prefix = '@' + sys.argv[1]
-    args = parser.parse_args([arg_filename_with_prefix])
+    # Check if it's a YAML config file
+    if sys.argv[1].endswith('.yaml') or sys.argv[1].endswith('.yml'):
+        args = parser.parse_args(['--config', sys.argv[1]])
+        config = load_config(sys.argv[1])
+        args = merge_config_with_args(config, args)
+    else:
+        # Legacy txt config file support
+        arg_filename_with_prefix = '@' + sys.argv[1]
+        args = parser.parse_args([arg_filename_with_prefix])
 else:
     args = parser.parse_args()
+    if args.config:
+        config = load_config(args.config)
+        args = merge_config_with_args(config, args)
 
-if args.dataset == 'kitti' or args.dataset == 'nyu':
+# Validate required arguments
+if not args.data_path or not args.gt_path or not args.filenames_file:
+    parser.error('--data_path, --gt_path, and --filenames_file are required (either via command line or config file)')
+
+if args.dataset == 'kitti' or args.dataset == 'nyu' or args.dataset == 'nyu_matched':
     from dataloaders.dataloader import NewDataLoader
+
+# Import relational modules if needed
+if hasattr(args, 'use_relational_loss') and args.use_relational_loss:
+    from dataloaders.nyu_relational_dataset import create_nyu_relational_dataloader
+    from networks.relational_depth_loss import RelationalDepthLoss
 
 if not os.path.exists("./models/"):
     os.makedirs("./models/")
@@ -96,22 +155,29 @@ def online_eval(model, dataloader_eval, post_process=False):
                 print('Invalid depth. continue.')
                 continue
 
-            # Read Text and Image Feature
+            # Read Text and Image Feature (with caching)
             text_feature_list = []
             for i in range(len(eval_sample_batched['sample_path'])):
+                # Remove leading slash from path
+                rgb_path = eval_sample_batched['sample_path'][i].split(' ')[0].lstrip('/')
+                
                 if args.dataset == "nyu":
-                    text_feature_path = "./text_feat/nyu/test/" + \
-                        eval_sample_batched['sample_path'][i].split(' ')[0][:-4]+'.pt'
+                    text_feature_path = "./text_feat/nyu/test/" + rgb_path[:-4] + '.pt'
+                elif args.dataset == "nyu_matched":
+                    text_feature_path = "./matched_dataset/text_feat-matched/" + rgb_path[:-4] + '.pt'
                 elif args.dataset == "kitti":
-                    text_feature_path = "./text_feat/kitti/test/" + \
-                        eval_sample_batched['sample_path'][i].split(' ')[0][:-4]+'.pt'
+                    text_feature_path = "./text_feat/kitti/test/" + rgb_path[:-4] + '.pt'
 
-                text_feature = torch.load(text_feature_path, map_location=image.device)
+                # Use cache
+                global TEXT_FEAT_CACHE
+                if text_feature_path not in TEXT_FEAT_CACHE:
+                    TEXT_FEAT_CACHE[text_feature_path] = torch.load(text_feature_path, map_location="cpu")
+                text_feature = TEXT_FEAT_CACHE[text_feature_path].to(image.device, non_blocking=True)
                 text_feature_list.append(text_feature)
 
             text_feature_list = torch.cat(text_feature_list, dim=0)
 
-            # Forwarding Model
+            # Forwarding Model (evaluation mode - no relational loss)
             pred_depth = model(image, text_feature_list, sample_from_gaussian=False)
 
             pred_depth = pred_depth.cpu().numpy().squeeze()
@@ -166,6 +232,20 @@ def online_eval(model, dataloader_eval, post_process=False):
 
 
 def main_worker(args):
+    # Initialize relational loss if enabled
+    use_relational = getattr(args, 'use_relational_loss', False)
+    relational_loss_fn = None
+    if use_relational:
+        from networks.relational_depth_loss import RelationalDepthLoss
+        relational_loss_fn = RelationalDepthLoss(
+            margin_rank=getattr(args, 'margin_rank', 0.1),
+            margin_occ=getattr(args, 'margin_occ', 0.3),
+            lambda_occ=getattr(args, 'lambda_occ', 1.5),
+            min_pixels=20,
+            use_median=getattr(args, 'use_median_depth', False)
+        )
+        print(f"== Relational Loss enabled (weight={getattr(args, 'weight_relational', 0.1)})")
+    
     model = WorDepth(pretrained=args.pretrain,
                        max_depth=args.max_depth,
                        prior_mean=args.prior_mean,
@@ -181,7 +261,7 @@ def main_worker(args):
     num_params_update = sum([np.prod(p.shape) for p in model.parameters() if p.requires_grad])
     print("== Total number of learning parameters: {}".format(num_params_update))
 
-    model = torch.nn.DataParallel(model)
+    # Single GPU - no DataParallel overhead
     model.cuda()
 
     print("== Model Initialized")
@@ -192,7 +272,7 @@ def main_worker(args):
     best_eval_steps = np.zeros(9, dtype=np.int32)
 
     # Training parameters
-    optimizer = torch.optim.Adam([{'params': model.module.parameters()}],
+    optimizer = torch.optim.Adam([{'params': model.parameters()}],
                                 lr=args.learning_rate,
                                 weight_decay=args.weight_decay)
 
@@ -223,8 +303,21 @@ def main_worker(args):
 
     torch.backends.cudnn.benchmark = True
 
-    dataloader = NewDataLoader(args, 'train')
-    dataloader_eval = NewDataLoader(args, 'online_eval')
+    # Choose dataloader based on relational loss setting
+    if use_relational and getattr(args, 'relations_dir_train', None):
+        from dataloaders.nyu_relational_dataset import create_nyu_relational_dataloader
+        dataloader = create_nyu_relational_dataloader(args, 'train')
+        print("== Using NYURelationalDataset for training")
+    else:
+        dataloader = NewDataLoader(args, 'train')
+        if use_relational:
+            print("Warning: use_relational_loss=True but no relations_dir_train specified, using standard dataloader")
+    
+    if use_relational and getattr(args, 'relations_dir_eval', None):
+        from dataloaders.nyu_relational_dataset import create_nyu_relational_dataloader
+        dataloader_eval = create_nyu_relational_dataloader(args, 'online_eval')
+    else:
+        dataloader_eval = NewDataLoader(args, 'online_eval')
 
     # ===== Evaluation before training ======
     if args.eval_before_train is True or args.eval_only is True:
@@ -250,26 +343,49 @@ def main_worker(args):
 
     while epoch < args.num_epochs:
 
-        for step, sample_batched in enumerate(dataloader.data):
+        for step, sample_batched in enumerate(tqdm(dataloader.data, desc=f'Epoch {epoch}/{args.num_epochs}', total=steps_per_epoch)):
             optimizer.zero_grad()
             image = sample_batched['image'].cuda(non_blocking=True)
             depth_gt = sample_batched['depth'].cuda(non_blocking=True)
 
-            # Read Text and Image Feature
+            # Read Text and Image Feature (with caching)
             text_feature_list = []
             for i in range(len(sample_batched['sample_path'])):
+                # Remove leading slash from path
+                rgb_path = sample_batched['sample_path'][i].split(' ')[0].lstrip('/')
+                
                 if args.dataset == "nyu":
-                    text_feature_path = "./text_feat/nyu/train/" + \
-                        sample_batched['sample_path'][i].split(' ')[0][:-4]+'.pt'
+                    text_feature_path = "./text_feat/nyu/train/" + rgb_path[:-4] + '.pt'
+                elif args.dataset == "nyu_matched":
+                    text_feature_path = "./matched_dataset/text_feat-matched/" + rgb_path[:-4] + '.pt'
                 elif args.dataset == "kitti":
-                    text_feature_path = "./text_feat/kitti/train/" + \
-                        sample_batched['sample_path'][i].split(' ')[0][:-4]+'.pt'
+                    text_feature_path = "./text_feat/kitti/train/" + rgb_path[:-4] + '.pt'
 
-                text_feature = torch.load(text_feature_path, map_location=image.device)
+                # Use cache
+                global TEXT_FEAT_CACHE
+                if text_feature_path not in TEXT_FEAT_CACHE:
+                    TEXT_FEAT_CACHE[text_feature_path] = torch.load(text_feature_path, map_location="cpu")
+                text_feature = TEXT_FEAT_CACHE[text_feature_path].to(image.device, non_blocking=True)
                 text_feature_list.append(text_feature)
 
             text_feature_list = torch.cat(text_feature_list, dim=0)
+            
+            # Get masks and relations if available
+            masks = sample_batched.get('masks', None)
+            relations = sample_batched.get('relations', None)
+            
+            # Forward pass
             depth_est, loss = model(image, text_feature_list, depth_gt)
+            
+            # Add relational loss if enabled
+            if use_relational and relational_loss_fn is not None and masks is not None and relations is not None:
+                rel_loss = relational_loss_fn(depth_est, masks, relations)
+                weight_rel = getattr(args, 'weight_relational', 0.1)
+                loss = loss + weight_rel * rel_loss
+                
+                # Log relational loss separately
+                if global_step and global_step % args.log_freq == 0 and not model_just_loaded:
+                    summary_writer.add_scalar("relational_loss", rel_loss.item(), int(global_step))
 
             loss.backward()
 
@@ -342,6 +458,11 @@ def main():
         print('train.py is only for training.')
         return -1
 
+    # Set GPU devices if specified
+    if args.gpu_devices is not None:
+        os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_devices
+        print(f"== Using GPU devices: {args.gpu_devices}")
+    
     args_out_path = os.path.join(args.log_directory, args.model_name)
     os.makedirs(args_out_path, exist_ok=True)
     os.system('cp ' + sys.argv[1] + ' ' + args_out_path)

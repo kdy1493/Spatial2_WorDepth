@@ -349,9 +349,13 @@ class WorDepth(nn.Module):
 
         if self.training:
             if sample_from_gaussian is True:
-                loss = self.si_loss(depth_pred, depth_gt) + self.weight_kld * kld_text_mean_std_loss
+                # Clamp KLD loss to prevent negative total loss
+                kld_loss = torch.clamp(kld_text_mean_std_loss, min=0.0)
+                loss = self.si_loss(depth_pred, depth_gt) + self.weight_kld * kld_loss
             else:
-                loss = self.si_loss(depth_pred, depth_gt) + self.weight_kld * kld_image_eps_loss
+                # Clamp KLD loss to prevent negative total loss
+                kld_loss = torch.clamp(kld_image_eps_loss, min=0.0)
+                loss = self.si_loss(depth_pred, depth_gt) + self.weight_kld * kld_loss
             return depth_pred, loss
         else:
             return depth_pred

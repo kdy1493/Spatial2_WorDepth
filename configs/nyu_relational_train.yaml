@@ -1,0 +1,58 @@
+# NYU-Depth-v2 Matched Dataset with Relational Loss Training Configuration (Optimized)
+
+# Overall
+mode: train
+model_name: nyu_matched_relational_train
+pretrain: ./swin_large_patch4_window12_384_22k.pth
+
+# Dataset
+dataset: nyu_matched
+data_path: /home/dongyub/WorDepth/matched_dataset/nyu-depth-v2-matched/
+gt_path: /home/dongyub/WorDepth/matched_dataset/nyu-depth-v2-matched/
+filenames_file: ./data_splits/nyu_matched_train_files_with_gt.txt
+input_height: 480
+input_width: 640
+max_depth: 10
+
+# Training (Optimized)
+batch_size: 8               # ↑ from 4
+num_epochs: 40              # ↓ from 50
+learning_rate: 3.0e-5
+end_learning_rate: 1.0e-5
+weight_decay: 0.0
+adam_eps: 1.0e-3
+num_threads: 8              # ✅ 데이터 로딩 병목 완화
+gpu_devices: "5"  # GPU device(s) to use (different from main training)
+
+# Preprocessing
+do_random_rotate: true
+degree: 2.5
+
+# Log and save
+log_directory: ./models/
+log_freq: 100
+save_freq: 2500             # ✅ 더 자주 저장 (안전성)
+
+# Online evaluation
+do_online_eval: true
+eval_freq: 2500             # ✅ 약 4.4 epoch마다 평가 (오버헤드 줄임)
+data_path_eval: /home/dongyub/WorDepth/matched_dataset/nyu-depth-v2-matched/
+gt_path_eval: /home/dongyub/WorDepth/matched_dataset/nyu-depth-v2-matched/
+filenames_file_eval: ./data_splits/nyu_matched_test_files_with_gt.txt
+min_depth_eval: 1.0e-3
+max_depth_eval: 10
+eigen_crop: true
+
+# WorDepth
+weight_kld: 1.0e-3
+alter_prob: 0.5
+
+# Relational Loss (NEW)
+use_relational_loss: true
+weight_relational: 0.1
+relations_dir_train: /home/dongyub/WorDepth/matched_dataset/nyu-processed-matched/train
+relations_dir_eval: /home/dongyub/WorDepth/matched_dataset/nyu-processed-matched/test
+margin_rank: 0.1      # margin for front/behind relations (meters)
+margin_occ: 0.3       # margin for occlusion relations (meters, stronger)
+lambda_occ: 1.5       # weight multiplier for occlusion
+use_median_depth: false  # use mean depth (more stable gradient)
