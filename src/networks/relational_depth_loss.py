@@ -38,7 +38,8 @@ class RelationalDepthLoss(nn.Module):
                  margin_occ=0.3,
                  lambda_occ=1.5,
                  min_pixels=20,
-                 use_median=False):
+                 use_median=False,
+                 debug_relational=False):
         """
         Args:
             margin_rank: margin for general front/behind relations (meters)
@@ -46,6 +47,7 @@ class RelationalDepthLoss(nn.Module):
             lambda_occ:  weight multiplier for occlusion relations
             min_pixels:  minimum pixels in mask to consider object (ignore too small objects)
             use_median:  if True, use median depth; if False, use mean depth
+            debug_relational: if True, enable debug prints
         """
         super().__init__()
         self.margin_rank = margin_rank
@@ -54,6 +56,7 @@ class RelationalDepthLoss(nn.Module):
         self.min_pixels = min_pixels
         self.use_median = use_median
         self.relu = nn.ReLU()
+        self.debug_relational = debug_relational
 
     def compute_object_depth(self, depth_map, mask):
         """
@@ -66,8 +69,8 @@ class RelationalDepthLoss(nn.Module):
         Returns:
             avg_depth: scalar tensor or None if mask too small
         """
-        # Apply binary threshold for clean masking
-        mask = (mask > 0.5).float()
+        # Move mask to same device as depth_map and apply binary threshold
+        mask = (mask > 0.5).float().to(depth_map.device)
         num_pixels = mask.sum()
 
         if num_pixels.item() < self.min_pixels:
@@ -92,16 +95,15 @@ class RelationalDepthLoss(nn.Module):
 
     def forward(self, depth_pred, masks_batch, relations_batch):
         """
-        Compute relational depth loss.
-        
+        Optimized: Compute relational depth loss with full vectorization (no for-loop over relations).
         Args:
             depth_pred:      (B, 1, H, W) predicted depth
             masks_batch:     list of length B, each Tensor(N_i, H, W)
             relations_batch: list of length B, each list[dict]
-        
         Returns:
             loss: scalar tensor (0 if no valid relations)
         """
+        import torch.nn.functional as F
         device = depth_pred.device
         B, _, H_d, W_d = depth_pred.shape
 
@@ -118,6 +120,7 @@ class RelationalDepthLoss(nn.Module):
                 continue
 
             # Resize masks to match depth resolution
+
             if cur_masks.shape[-2:] != (H_d, W_d):
                 cur_masks = F.interpolate(
                     cur_masks.unsqueeze(1).float(),   # (N, 1, H_m, W_m)
@@ -127,57 +130,51 @@ class RelationalDepthLoss(nn.Module):
             else:
                 cur_masks = cur_masks.float()
 
+            # 항상 cur_depth와 동일한 디바이스로 이동
+            cur_masks = cur_masks.to(cur_depth.device)
+
             N_obj = cur_masks.shape[0]
+            # 1. 객체별 대표 깊이 (mean)
+            mask_sum = cur_masks.sum(dim=(1,2)) + 1e-8  # (N_obj,)
+            obj_depths = (cur_depth * cur_masks).sum(dim=(1,2)) / mask_sum  # (N_obj,)
 
-            # Iterate through relations
+            # 2. 관계 정보 벡터화
+            rels = []
             for rel in cur_rels:
-                idx_A = rel['subject_idx']
-                idx_B = rel['object_idx']
                 rel_type = rel.get('relation', 'front').lower()
-                confidence = float(rel.get('confidence', 1.0))
-
-                # Skip unsupported relation types
-                supported_types = {'front', 'behind', 'occludes'}
-                if rel_type not in supported_types:
+                if rel_type not in {'front', 'behind', 'occludes'}:
                     continue
-
-                # Convert 'behind' to 'front' by swapping indices
+                # 'behind'는 subject/object swap
                 if rel_type == 'behind':
-                    idx_A, idx_B = idx_B, idx_A
-                    rel_type = 'front'
+                    rel = rel.copy()
+                    rel['subject_idx'], rel['object_idx'] = rel['object_idx'], rel['subject_idx']
+                    rel['relation'] = 'front'
+                rels.append(rel)
+            if len(rels) == 0:
+                continue
 
-                # Validate indices
-                if idx_A >= N_obj or idx_B >= N_obj or idx_A < 0 or idx_B < 0:
-                    continue
+            idx_A = torch.tensor([r['subject_idx'] for r in rels], device=device, dtype=torch.long)
+            idx_B = torch.tensor([r['object_idx'] for r in rels], device=device, dtype=torch.long)
+            rel_type_list = [r.get('relation', 'front').lower() for r in rels]
+            confidence = torch.tensor([float(r.get('confidence', 1.0)) for r in rels], device=device, dtype=depth_pred.dtype)
 
-                mask_A = cur_masks[idx_A]   # (H_d, W_d)
-                mask_B = cur_masks[idx_B]   # (H_d, W_d)
+            # 3. 관계별 d_A, d_B
+            d_A = obj_depths[idx_A]  # (n_rel,)
+            d_B = obj_depths[idx_B]  # (n_rel,)
 
-                d_A = self.compute_object_depth(cur_depth, mask_A)
-                d_B = self.compute_object_depth(cur_depth, mask_B)
+            # 4. margin, coeff 벡터화
+            rel_type_tensor = torch.tensor([1 if t == 'occludes' else 0 for t in rel_type_list], device=device, dtype=depth_pred.dtype)
+            margin = rel_type_tensor * self.margin_occ + (1 - rel_type_tensor) * self.margin_rank
+            coeff = rel_type_tensor * self.lambda_occ + (1 - rel_type_tensor) * 1.0
 
-                if d_A is None or d_B is None:
-                    continue
+            # 5. violation 및 loss
+            violation = self.relu(d_A - d_B + margin)
+            loss_vec = coeff * confidence * violation
+            total_loss = total_loss + loss_vec.sum()
+            valid_rel_count += loss_vec.numel()
 
-                # Metric depth: A is in front means d_A < d_B
-                # Violation: max(0, d_A - d_B + margin)
-                if rel_type == 'occludes':
-                    margin = self.margin_occ
-                    coeff  = self.lambda_occ
-                else:  # 'front'
-                    margin = self.margin_rank
-                    coeff  = 1.0
-
-                # Hinge loss: penalize if d_A >= d_B - margin
-                violation = self.relu(d_A - d_B + margin)
-                total_loss = total_loss + coeff * confidence * violation
-                valid_rel_count += 1
-
-        # Return zero loss with gradient if no valid relations
         if valid_rel_count == 0:
-            return depth_pred.new_tensor(0.0)  # Inherits requires_grad from depth_pred
-
-        # Average over valid relations
+            return depth_pred.new_tensor(0.0)
         return total_loss / valid_rel_count
 
 

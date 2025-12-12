@@ -35,7 +35,8 @@ class NYURelationalDataset(Dataset):
                  max_depth=10.0,
                  do_random_rotate=False,
                  degree=2.5,
-                 use_relational_loss=True):
+                 use_relational_loss=True,
+                 debug_relational=False):
         """
         Args:
             filenames_file: path to filenames list (optional, if None auto-scans directories)
@@ -53,6 +54,7 @@ class NYURelationalDataset(Dataset):
         if relations_base_path and not os.path.isabs(relations_base_path):
             self.relations_base_path = os.path.abspath(relations_base_path)
         self.use_relational_loss = use_relational_loss
+        self.debug_relational = debug_relational
         
         self.input_height = input_height
         self.input_width = input_width
@@ -268,6 +270,19 @@ class NYURelationalDataset(Dataset):
         # Load relational annotations if needed
         if self.use_relational_loss and self.relations_base_path:
             masks, relations = self._load_relational_annotations(rgb_file)
+            # 디버깅: 마스크/관계 정보 shape, 길이, 값 확인 (옵션)
+            if self.debug_relational:
+                if masks is not None:
+                    try:
+                        print(f"[RelAnn] {rgb_file} masks shape: {masks.shape}, min: {masks.min().item():.4f}, max: {masks.max().item():.4f}, N_obj: {masks.shape[0]}")
+                    except Exception:
+                        print(f"[RelAnn] {rgb_file} masks shape: {getattr(masks,'shape',None)}")
+                else:
+                    print(f"[RelAnn] {rgb_file} masks: None")
+                if relations is not None:
+                    print(f"[RelAnn] {rgb_file} relations: {len(relations)}")
+                else:
+                    print(f"[RelAnn] {rgb_file} relations: None")
             sample['masks'] = masks
             sample['relations'] = relations
         
@@ -286,11 +301,19 @@ class NYURelationalDataset(Dataset):
         """
         # Normalize to forward slash for path construction
         rgb_file_unix = rgb_file.replace(os.sep, '/')
-        
+
         # Construct paths
         scene_name = os.path.dirname(rgb_file_unix)
         rgb_basename = os.path.basename(rgb_file_unix).replace('.jpg', '').replace('.png', '')
-        
+
+        # Remove duplicated dataset split prefix if present (e.g., filenames use 'train/scene/..' but
+        # relations_base_path already points to the '.../train' folder). This avoids paths like
+        #  .../nyu-processed-matched/train/train/scene/...
+        first_seg = scene_name.split('/', 1)[0]
+        if first_seg in ('train', 'test'):
+            # drop the leading 'train/' or 'test/'
+            scene_name = scene_name.split('/', 1)[1] if '/' in scene_name else ''
+
         mask_path = os.path.join(
             self.relations_base_path,
             scene_name,
@@ -301,6 +324,14 @@ class NYURelationalDataset(Dataset):
             scene_name,
             f"{rgb_basename}_relations.json"
         )
+
+        # Debug: show the constructed paths and whether files exist (only when debugging enabled)
+        try:
+            if getattr(self, 'debug_relational', False):
+                print(f"[RelAnn.path] mask_path={mask_path}, exists={os.path.exists(mask_path)}")
+                print(f"[RelAnn.path] rel_path={rel_path}, exists={os.path.exists(rel_path)}")
+        except Exception:
+            pass
         
         # Load masks
         try:
@@ -433,7 +464,8 @@ def create_nyu_relational_dataloader(args, mode='train'):
         max_depth=args.max_depth,
         do_random_rotate=getattr(args, 'do_random_rotate', False),
         degree=getattr(args, 'degree', 2.5),
-        use_relational_loss=use_relational_loss
+        use_relational_loss=use_relational_loss,
+        debug_relational=getattr(args, 'debug_relational', False)
     )
     
     # Create dataloader

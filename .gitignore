@@ -19,3 +19,4 @@ results/
 logs/
 *.log
 .ipynb_checkpoints
+models_1/

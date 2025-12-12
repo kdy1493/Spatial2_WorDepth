@@ -91,6 +91,7 @@ parser.add_argument('--margin_rank',           type=float, default=0.1, help='ma
 parser.add_argument('--margin_occ',            type=float, default=0.3, help='margin for occlusion relations')
 parser.add_argument('--lambda_occ',            type=float, default=1.5, help='weight for occlusion relations')
 parser.add_argument('--use_median_depth',      action='store_true', help='use median instead of mean for object depth')
+parser.add_argument('--debug_relational',     action='store_true', help='enable verbose relational debugging prints')
 
 
 def load_config(config_path):
@@ -179,7 +180,7 @@ def online_eval(model, dataloader_eval, post_process=False):
             text_feature_list = torch.cat(text_feature_list, dim=0)
 
             # Forwarding Model (evaluation mode - no relational loss)
-            pred_depth = model(image, text_feature_list, sample_from_gaussian=False)
+            pred_depth = model(image, text_feature_list)
 
             pred_depth = pred_depth.cpu().numpy().squeeze()
             gt_depth = gt_depth.cpu().numpy().squeeze()
@@ -243,27 +244,41 @@ def main_worker(args):
             margin_occ=getattr(args, 'margin_occ', 0.3),
             lambda_occ=getattr(args, 'lambda_occ', 1.5),
             min_pixels=20,
-            use_median=getattr(args, 'use_median_depth', False)
+            use_median=getattr(args, 'use_median_depth', False),
+            debug_relational=getattr(args, 'debug_relational', False)
         )
         print(f"== Relational Loss enabled (weight={getattr(args, 'weight_relational', 0.1)})")
     
+
     model = WorDepth(pretrained=args.pretrain,
-                       max_depth=args.max_depth,
-                       prior_mean=args.prior_mean,
-                       img_size=(args.input_height, args.input_width),
-                       weight_kld=args.weight_kld,
-                       alter_prob=args.alter_prob,
-                       legacy=args.legacy)
+                     max_depth=args.max_depth,
+                     prior_mean=args.prior_mean,
+                     img_size=(args.input_height, args.input_width),
+                     weight_kld=args.weight_kld,
+                     alter_prob=args.alter_prob,
+                     legacy=args.legacy)
     model.train()
+
+    # Multi-GPU support
+    n_gpus = torch.cuda.device_count()
+    if args.gpu_devices:
+        # CUDA_VISIBLE_DEVICES가 세팅되면 torch에서는 0,1,...로 인식됨
+        gpu_ids = list(range(len(args.gpu_devices.split(","))))  # 항상 [0, 1, ...]
+    else:
+        gpu_ids = list(range(n_gpus))
+
+    if len(gpu_ids) > 1:
+        print(f"== Using DataParallel on GPUs: {gpu_ids}")
+        model = torch.nn.DataParallel(model, device_ids=gpu_ids)
+    else:
+        print(f"== Using single GPU: {gpu_ids[0] if gpu_ids else 0}")
+    model = model.cuda()
 
     num_params = sum([np.prod(p.size()) for p in model.parameters()])
     print("== Total number of parameters: {}".format(num_params))
 
     num_params_update = sum([np.prod(p.shape) for p in model.parameters() if p.requires_grad])
     print("== Total number of learning parameters: {}".format(num_params_update))
-
-    # Single GPU - no DataParallel overhead
-    model.cuda()
 
     print("== Model Initialized")
 
@@ -392,6 +407,9 @@ def main_worker(args):
                     if global_step and global_step % args.log_freq == 0 and not model_just_loaded:
                         summary_writer.add_scalar("relational_loss", rel_loss.item(), int(global_step))
 
+            # loss가 스칼라가 아니면 .mean() 적용
+            if hasattr(loss, 'dim') and loss.dim() > 0:
+                loss = loss.mean()
             scaler.scale(loss).backward()
 
             scaler.unscale_(optimizer)
