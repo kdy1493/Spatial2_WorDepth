@@ -1,3 +1,4 @@
+
 import torch
 import os, sys
 import argparse
@@ -9,6 +10,23 @@ from torch.cuda.amp import autocast, GradScaler
 from utils import compute_errors, eval_metrics, block_print, enable_print, convert_arg_line_to_args
 from networks.wordepth import WorDepth
 from dataloaders.dataloader import NewDataLoader
+
+# Tee class for logging stdout to file and terminal
+class Tee(object):
+    def __init__(self, filename, mode="a"):
+        self.file = open(filename, mode)
+        self.stdout = sys.stdout
+
+    def write(self, data):
+        self.file.write(data)
+        self.stdout.write(data)
+
+    def flush(self):
+        self.file.flush()
+        self.stdout.flush()
+
+    def close(self):
+        self.file.close()
 
 # Global cache for text features
 TEXT_FEAT_CACHE = {}
@@ -483,16 +501,21 @@ def main():
         print('train.py is only for training.')
         return -1
 
+
     # Set GPU devices if specified
     if args.gpu_devices is not None:
         os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_devices
         print(f"== Using GPU devices: {args.gpu_devices}")
-    
+
     args_out_path = os.path.join(args.log_directory, args.model_name)
     os.makedirs(args_out_path, exist_ok=True)
     os.system('cp ' + sys.argv[1] + ' ' + args_out_path)
     os.system('cp ' + "src/train.py" + ' ' + args_out_path + "/train.py.backup")
     os.system('cp ' + "src/networks/wordepth.py" + ' ' + args_out_path + "/wordepth.py.backup")
+
+    # Redirect stdout to tee (log file + terminal)
+    log_path = os.path.join(args.log_directory, args.model_name, "train.log")
+    sys.stdout = Tee(log_path, "a")
 
     torch.cuda.empty_cache()
 
