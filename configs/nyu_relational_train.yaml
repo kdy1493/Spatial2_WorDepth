@@ -12,11 +12,11 @@ gt_path: /home/dongyub/WorDepth/matched_dataset/nyu-depth-v2-matched/
 filenames_file: ./data_splits/nyu_matched_train_files_with_gt.txt
 input_height: 480
 input_width: 640
-max_depth: 10
+max_depth: 10               # NYU-matched: 0-10m range (scaled by /6553.5)
 
 # Training (Optimized)
 batch_size: 8               # ↑ from 4
-num_epochs: 40              # ↓ from 50
+num_epochs: 30              # ↓ from 40 (시간 단축)
 learning_rate: 3.0e-5
 end_learning_rate: 1.0e-5
 weight_decay: 0.0
@@ -31,6 +31,7 @@ degree: 2.5
 # Log and save
 log_directory: ./models/
 log_freq: 100
+store_freq: 2500            # eval_freq와 동일하게 (metric과 checkpoint 동기화)
 save_freq: 2500             # ✅ 더 자주 저장 (안전성)
 
 # Online evaluation
@@ -40,7 +41,7 @@ data_path_eval: /home/dongyub/WorDepth/matched_dataset/nyu-depth-v2-matched/
 gt_path_eval: /home/dongyub/WorDepth/matched_dataset/nyu-depth-v2-matched/
 filenames_file_eval: ./data_splits/nyu_matched_test_files_with_gt.txt
 min_depth_eval: 1.0e-3
-max_depth_eval: 10
+max_depth_eval: 10       # NYU-matched: 0-10m range (scaled by /6553.5)
 eigen_crop: true
 
 # WorDepth

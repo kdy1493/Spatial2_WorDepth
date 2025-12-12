@@ -1,0 +1,6 @@
+cuda_visible_devices: 5
+config: configs/nyu_matched_train.yaml
+checkpoint: models/nyu_matched_train/model-12500-best_abs_rel_0.13248
+output_dir: results/baseline_test
+num_samples: 0
+save_all: false

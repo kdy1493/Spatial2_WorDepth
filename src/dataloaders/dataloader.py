@@ -121,9 +121,11 @@ class DataLoadPreprocess(Dataset):
             depth_gt = np.expand_dims(depth_gt, axis=2)
 
             if self.args.dataset == 'nyu':
-                depth_gt = depth_gt / 1000.0
+                depth_gt = depth_gt / 1000.0  # NYU: mm to m
+            elif self.args.dataset == 'nyu_matched':
+                depth_gt = depth_gt / 6553.5  # NYU-matched: 16-bit (0-65535) -> 0-10m
             else:
-                depth_gt = depth_gt / 256.0
+                depth_gt = depth_gt / 256.0  # KITTI
 
             if image.shape[0] != self.args.input_height or image.shape[1] != self.args.input_width:
                 image, depth_gt = self.random_crop(image, depth_gt, self.args.input_height, self.args.input_width)
@@ -157,9 +159,11 @@ class DataLoadPreprocess(Dataset):
                     depth_gt = np.asarray(depth_gt, dtype=np.float32)
                     depth_gt = np.expand_dims(depth_gt, axis=2)
                     if self.args.dataset == 'nyu':
-                        depth_gt = depth_gt / 1000.0
+                        depth_gt = depth_gt / 1000.0  # NYU: mm to m
+                    elif self.args.dataset == 'nyu_matched':
+                        depth_gt = depth_gt / 6553.5  # NYU-matched: 16-bit (0-65535) -> 0-10m
                     else:
-                        depth_gt = depth_gt / 256.0
+                        depth_gt = depth_gt / 256.0  # KITTI
 
             if self.args.do_kb_crop is True:
                 height = image.shape[0]

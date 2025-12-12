@@ -5,6 +5,7 @@ import numpy as np
 import yaml
 from tqdm import tqdm
 from tensorboardX import SummaryWriter
+from torch.cuda.amp import autocast, GradScaler
 from utils import compute_errors, eval_metrics, block_print, enable_print, convert_arg_line_to_args
 from networks.wordepth import WorDepth
 from dataloaders.dataloader import NewDataLoader
@@ -208,7 +209,7 @@ def online_eval(model, dataloader_eval, post_process=False):
             elif args.eigen_crop:
                 if args.dataset == 'kitti':
                     eval_mask[int(0.3324324 * gt_height):int(0.91351351 * gt_height), int(0.0359477 * gt_width):int(0.96405229 * gt_width)] = 1
-                elif args.dataset == 'nyu':
+                elif args.dataset in ['nyu', 'nyu_matched']:
                     eval_mask[45:471, 41:601] = 1
 
             valid_mask = np.logical_and(valid_mask, eval_mask)
@@ -337,6 +338,9 @@ def main_worker(args):
 
     end_learning_rate = args.end_learning_rate if args.end_learning_rate != -1 else args.learning_rate
 
+    # Mixed Precision Training
+    scaler = GradScaler()
+
     steps_per_epoch = len(dataloader.data)
     num_total_steps = args.num_epochs * steps_per_epoch
     epoch = global_step // steps_per_epoch
@@ -374,24 +378,27 @@ def main_worker(args):
             masks = sample_batched.get('masks', None)
             relations = sample_batched.get('relations', None)
             
-            # Forward pass
-            depth_est, loss = model(image, text_feature_list, depth_gt)
-            
-            # Add relational loss if enabled
-            if use_relational and relational_loss_fn is not None and masks is not None and relations is not None:
-                rel_loss = relational_loss_fn(depth_est, masks, relations)
-                weight_rel = getattr(args, 'weight_relational', 0.1)
-                loss = loss + weight_rel * rel_loss
+            # Forward pass with mixed precision
+            with autocast():
+                depth_est, loss = model(image, text_feature_list, depth_gt)
                 
-                # Log relational loss separately
-                if global_step and global_step % args.log_freq == 0 and not model_just_loaded:
-                    summary_writer.add_scalar("relational_loss", rel_loss.item(), int(global_step))
+                # Add relational loss if enabled
+                if use_relational and relational_loss_fn is not None and masks is not None and relations is not None:
+                    rel_loss = relational_loss_fn(depth_est, masks, relations)
+                    weight_rel = getattr(args, 'weight_relational', 0.1)
+                    loss = loss + weight_rel * rel_loss
+                    
+                    # Log relational loss separately
+                    if global_step and global_step % args.log_freq == 0 and not model_just_loaded:
+                        summary_writer.add_scalar("relational_loss", rel_loss.item(), int(global_step))
 
-            loss.backward()
+            scaler.scale(loss).backward()
 
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
 
             for param_group in optimizer.param_groups:
                 current_lr = (args.learning_rate - end_learning_rate) * (1 - global_step / num_total_steps) ** 0.9 + end_learning_rate

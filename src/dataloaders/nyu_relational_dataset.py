@@ -224,10 +224,10 @@ class NYURelationalDataset(Dataset):
         # Load image
         image = Image.open(image_path).convert('RGB')
         
-        # Load depth (NYU는 16-bit PNG, mm 단위)
+        # Load depth (NYU-matched: 16-bit PNG where 65535 = 10m)
         depth_gt = Image.open(depth_path)
         depth_gt = np.array(depth_gt, dtype=np.float32)
-        depth_gt = depth_gt / 1000.0  # mm to meters
+        depth_gt = depth_gt / 6553.5  # 16-bit (0-65535) -> 0-10m
         depth_gt = np.expand_dims(depth_gt, axis=0)  # (1, H, W)
         
         # Resize if needed

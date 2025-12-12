@@ -84,7 +84,10 @@ class OutConv(nn.Module):
         self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
 
     def forward(self, x):
-        return torch.exp(self.conv(x) + self.prior_mean)
+        # Clamp to prevent overflow in exp
+        conv_out = self.conv(x) + self.prior_mean
+        conv_out = torch.clamp(conv_out, min=-10, max=10)
+        return torch.exp(conv_out)
 
 
 class EpsLayer(nn.Module):
@@ -345,7 +348,9 @@ class WorDepth(nn.Module):
         if sample_from_gaussian is True:
             depth_pred = self.outc(d_feat)
         else:
-            depth_pred = torch.sigmoid(metric[:, 0:1]) * (self.outc(d_feat) + torch.exp(metric[:, 1:2]))
+            # Clamp metric to prevent overflow in exp
+            metric_clamped = torch.clamp(metric[:, 1:2], min=-10, max=10)
+            depth_pred = torch.sigmoid(metric[:, 0:1]) * (self.outc(d_feat) + torch.exp(metric_clamped))
 
         if self.training:
             if sample_from_gaussian is True:

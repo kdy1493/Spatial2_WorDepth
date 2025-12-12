@@ -1,0 +1,6 @@
+cuda_visible_devices: 6
+config: configs/nyu_relational_train.yaml
+checkpoint: models/nyu_matched_relational_train/model-5000-best_abs_rel_0.13111
+output_dir: results/relational_test
+num_samples: 0
+save_all: false
