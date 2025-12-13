@@ -4,6 +4,7 @@ import os, sys
 import argparse
 import numpy as np
 import yaml
+import time
 from tqdm import tqdm
 from tensorboardX import SummaryWriter
 from torch.cuda.amp import autocast, GradScaler
@@ -30,6 +31,7 @@ class Tee(object):
 
 # Global cache for text features
 TEXT_FEAT_CACHE = {}
+TEXT_FEAT_CACHE_STATS = {'hits': 0, 'misses': 0}
 
 parser = argparse.ArgumentParser(description='WorDepth PyTorch implementation.', fromfile_prefix_chars='@')
 parser.convert_arg_line_to_args = convert_arg_line_to_args
@@ -68,6 +70,7 @@ parser.add_argument('--num_epochs',                type=int,   help='number of e
 parser.add_argument('--learning_rate',             type=float, help='initial learning rate', default=1e-4)
 parser.add_argument('--end_learning_rate',         type=float, help='end learning rate', default=-1)
 parser.add_argument('--variance_focus',            type=float, help='lambda in paper: [0, 1], higher value more focus on minimizing variance of error', default=0.85)
+parser.add_argument('--gradient_accumulation_steps', type=int, help='gradient accumulation steps', default=1)
 
 # Preprocessing
 parser.add_argument('--do_random_rotate',                      help='if set, will perform random rotation for augmentation', action='store_true')
@@ -156,11 +159,12 @@ if not args.data_path or not args.gt_path or not args.filenames_file:
 if args.dataset == 'kitti' or args.dataset == 'nyu' or args.dataset == 'nyu_matched':
     from dataloaders.dataloader import NewDataLoader
 
-# Import relational modules if needed
-if hasattr(args, 'use_relational_loss') and args.use_relational_loss:
-    from dataloaders.nyu_relational_dataset import create_nyu_relational_dataloader
-    from networks.relational_depth_loss import RelationalDepthLoss
-
+    # Import relational modules if needed
+    if hasattr(args, 'use_relational_loss') and args.use_relational_loss:
+        from dataloaders.nyu_relational_dataset import create_nyu_relational_dataloader
+        from networks.relational_depth_loss import RelationalDepthLoss
+        # Import cache stats for logging
+        from dataloaders.nyu_relational_dataset import RELATIONS_CACHE_STATS
 if not os.path.exists("./models/"):
     os.makedirs("./models/")
 
@@ -339,7 +343,9 @@ def main_worker(args):
 
     # Choose dataloader based on relational loss setting
     if use_relational and getattr(args, 'relations_dir_train', None):
-        from dataloaders.nyu_relational_dataset import create_nyu_relational_dataloader
+        from dataloaders.nyu_relational_dataset import create_nyu_relational_dataloader, preload_relations_cache
+        # Preload relations cache for faster training
+        preload_relations_cache(args.relations_dir_train, args.filenames_file)
         dataloader = create_nyu_relational_dataloader(args, 'train')
         print("== Using NYURelationalDataset for training")
     else:
@@ -381,11 +387,14 @@ def main_worker(args):
     while epoch < args.num_epochs:
 
         for step, sample_batched in enumerate(tqdm(dataloader.data, desc=f'Epoch {epoch}/{args.num_epochs}', total=steps_per_epoch)):
+            start_time = time.time()
+            
             optimizer.zero_grad()
             image = sample_batched['image'].cuda(non_blocking=True)
             depth_gt = sample_batched['depth'].cuda(non_blocking=True)
 
             # Read Text and Image Feature (with caching)
+            text_load_start = time.time()
             text_feature_list = []
             for i in range(len(sample_batched['sample_path'])):
                 # Remove leading slash from path
@@ -402,16 +411,21 @@ def main_worker(args):
                 global TEXT_FEAT_CACHE
                 if text_feature_path not in TEXT_FEAT_CACHE:
                     TEXT_FEAT_CACHE[text_feature_path] = torch.load(text_feature_path, map_location="cpu")
+                    TEXT_FEAT_CACHE_STATS['misses'] += 1
+                else:
+                    TEXT_FEAT_CACHE_STATS['hits'] += 1
                 text_feature = TEXT_FEAT_CACHE[text_feature_path].to(image.device, non_blocking=True)
                 text_feature_list.append(text_feature)
 
             text_feature_list = torch.cat(text_feature_list, dim=0)
+            text_load_time = time.time() - text_load_start
             
             # Get masks and relations if available
             masks = sample_batched.get('masks', None)
             relations = sample_batched.get('relations', None)
             
             # Forward pass with mixed precision
+            forward_start = time.time()
             with autocast():
                 depth_est, loss = model(image, text_feature_list, depth_gt)
                 
@@ -425,73 +439,95 @@ def main_worker(args):
                     if global_step and global_step % args.log_freq == 0 and not model_just_loaded:
                         summary_writer.add_scalar("relational_loss", rel_loss.item(), int(global_step))
 
+            forward_time = time.time() - forward_start
+            
             # loss가 스칼라가 아니면 .mean() 적용
             if hasattr(loss, 'dim') and loss.dim() > 0:
                 loss = loss.mean()
+            
+            # Gradient accumulation
+            loss = loss / args.gradient_accumulation_steps
             scaler.scale(loss).backward()
 
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            # Update weights every gradient_accumulation_steps
+            if (step + 1) % args.gradient_accumulation_steps == 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
-            scaler.step(optimizer)
-            scaler.update()
+                scaler.step(optimizer)
+                scaler.update()
 
-            for param_group in optimizer.param_groups:
-                current_lr = (args.learning_rate - end_learning_rate) * (1 - global_step / num_total_steps) ** 0.9 + end_learning_rate
-                param_group['lr'] = current_lr
+                backward_time = time.time() - forward_start - forward_time  # backward + optimizer step time
+                
+                total_time = time.time() - start_time
 
-            if global_step and global_step % args.log_freq == 0 and not model_just_loaded:
-                summary_writer.add_scalar("training_loss", loss.item(), int(global_step))
-                print('epoch:', epoch, 'global_step:', global_step, 'loss:', loss.item(), flush=True)
+                for param_group in optimizer.param_groups:
+                    current_lr = (args.learning_rate - end_learning_rate) * (1 - global_step / num_total_steps) ** 0.9 + end_learning_rate
+                    param_group['lr'] = current_lr
 
-            if args.store_freq != 0 and global_step % args.store_freq == 0:
-                checkpoint = {'global_step': global_step,
-                             'model': model.state_dict()}
-                model_save_name = '/model-{}'.format(global_step)
-                torch.save(checkpoint, args.log_directory + '/' + args.model_name + model_save_name)
+                if global_step and global_step % args.log_freq == 0 and not model_just_loaded:
+                    summary_writer.add_scalar("training_loss", loss.item() * args.gradient_accumulation_steps, int(global_step))  # scale back loss for logging
+                    print(f'epoch: {epoch}, global_step: {global_step}, loss: {loss.item() * args.gradient_accumulation_steps:.4f}', flush=True)
+                    print(f'  Times - Total: {total_time:.3f}s, TextLoad: {text_load_time:.3f}s, Forward: {forward_time:.3f}s, Backward: {backward_time:.3f}s', flush=True)
+                    total_requests = TEXT_FEAT_CACHE_STATS['hits'] + TEXT_FEAT_CACHE_STATS['misses']
+                    if total_requests > 0:
+                        hit_rate = TEXT_FEAT_CACHE_STATS['hits'] / total_requests * 100
+                        print(f'  Cache - Text Hits: {TEXT_FEAT_CACHE_STATS["hits"]}, Misses: {TEXT_FEAT_CACHE_STATS["misses"]}, Hit Rate: {hit_rate:.1f}%', flush=True)
+                    
+                    if use_relational:
+                        rel_total_requests = RELATIONS_CACHE_STATS['hits'] + RELATIONS_CACHE_STATS['misses']
+                        if rel_total_requests > 0:
+                            rel_hit_rate = RELATIONS_CACHE_STATS['hits'] / rel_total_requests * 100
+                            print(f'  Cache - Relations Hits: {RELATIONS_CACHE_STATS["hits"]}, Misses: {RELATIONS_CACHE_STATS["misses"]}, Hit Rate: {rel_hit_rate:.1f}%', flush=True)
 
-            if args.do_online_eval and global_step and global_step % args.eval_freq == 0 and not model_just_loaded:
-                model.eval()
-                with torch.no_grad():
-                    eval_measures = online_eval(model, dataloader_eval, post_process=False)
-                if eval_measures is not None:
-                    for i in range(9):
-                        summary_writer.add_scalar(eval_metrics[i], eval_measures[i].cpu(), int(global_step))
-                        measure = eval_measures[i]
-                        is_best = False
-                        if i < 6 and measure < best_eval_measures_lower_better[i]:
-                            old_best = best_eval_measures_lower_better[i].item()
-                            best_eval_measures_lower_better[i] = measure.item()
-                            is_best = True
-                        elif i >= 6 and measure > best_eval_measures_higher_better[i-6]:
-                            old_best = best_eval_measures_higher_better[i-6].item()
-                            best_eval_measures_higher_better[i-6] = measure.item()
-                            is_best = True
-                        if is_best:
-                            old_best_step = best_eval_steps[i]
-                            old_best_name = '/model-{}-best_{}_{:.5f}'.format(old_best_step, eval_metrics[i], old_best)
-                            model_path = args.log_directory + '/' + args.model_name + old_best_name
-                            if os.path.exists(model_path):
-                                command = 'rm {}'.format(model_path)
-                                os.system(command)
-                            best_eval_steps[i] = global_step
-                            model_save_name = '/model-{}-best_{}_{:.5f}'.format(global_step, eval_metrics[i], measure)
-                            print('New best for {}. Saving model: {}'.format(eval_metrics[i], model_save_name))
-                            checkpoint = {'global_step': global_step,
-                                          'model': model.state_dict(),
-                                        #   'optimizer': optimizer.state_dict(), # be careful, save this is quite large
-                                          'best_eval_measures_higher_better': best_eval_measures_higher_better,
-                                          'best_eval_measures_lower_better': best_eval_measures_lower_better,
-                                          'best_eval_steps': best_eval_steps
-                                          }
-                            torch.save(checkpoint, args.log_directory + '/' + args.model_name + model_save_name)
-                    summary_writer.flush()
-                model.train()
-                block_print()
-                enable_print()
+                if args.store_freq != 0 and global_step % args.store_freq == 0:
+                    checkpoint = {'global_step': global_step,
+                                 'model': model.state_dict()}
+                    model_save_name = '/model-{}'.format(global_step)
+                    torch.save(checkpoint, args.log_directory + '/' + args.model_name + model_save_name)
 
-            model_just_loaded = False
-            global_step += 1
+                if args.do_online_eval and global_step and global_step % args.eval_freq == 0 and not model_just_loaded:
+                    model.eval()
+                    with torch.no_grad():
+                        eval_measures = online_eval(model, dataloader_eval, post_process=False)
+                    if eval_measures is not None:
+                        for i in range(9):
+                            summary_writer.add_scalar(eval_metrics[i], eval_measures[i].cpu(), int(global_step))
+                            measure = eval_measures[i]
+                            is_best = False
+                            if i < 6 and measure < best_eval_measures_lower_better[i]:
+                                old_best = best_eval_measures_lower_better[i].item()
+                                best_eval_measures_lower_better[i] = measure.item()
+                                is_best = True
+                            elif i >= 6 and measure > best_eval_measures_higher_better[i-6]:
+                                old_best = best_eval_measures_higher_better[i-6].item()
+                                best_eval_measures_higher_better[i-6] = measure.item()
+                                is_best = True
+                            if is_best:
+                                old_best_step = best_eval_steps[i]
+                                old_best_name = '/model-{}-best_{}_{:.5f}'.format(old_best_step, eval_metrics[i], old_best)
+                                model_path = args.log_directory + '/' + args.model_name + old_best_name
+                                if os.path.exists(model_path):
+                                    command = 'rm {}'.format(model_path)
+                                    os.system(command)
+                                best_eval_steps[i] = global_step
+                                model_save_name = '/model-{}-best_{}_{:.5f}'.format(global_step, eval_metrics[i], measure)
+                                print('New best for {}. Saving model: {}'.format(eval_metrics[i], model_save_name))
+                                checkpoint = {'global_step': global_step,
+                                              'model': model.state_dict(),
+                                            #   'optimizer': optimizer.state_dict(), # be careful, save this is quite large
+                                              'best_eval_measures_higher_better': best_eval_measures_higher_better,
+                                              'best_eval_measures_lower_better': best_eval_measures_lower_better,
+                                              'best_eval_steps': best_eval_steps
+                                              }
+                                torch.save(checkpoint, args.log_directory + '/' + args.model_name + model_save_name)
+                        summary_writer.flush()
+                    model.train()
+                    block_print()
+                    enable_print()
+
+                model_just_loaded = False
+                global_step += 1
 
         epoch += 1
 

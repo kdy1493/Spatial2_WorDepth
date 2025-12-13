@@ -1,0 +1,42 @@
+# SAM2 + GT-Depth 기반 Relational Annotations 생성 설정 파일
+# 사용법: 
+#   Train: python src/data_generation/generate_relational_annotations.py --config config_relational_gen.yaml --mode train
+#   Test:  python src/data_generation/generate_relational_annotations.py --config config_relational_gen.yaml --mode test
+#
+# 또는 YAML 파일에서 직접 train/test 섹션을 선택하여 사용
+
+# ============================================================================
+# TRAIN 데이터셋 설정
+# ============================================================================
+train:
+  # 데이터셋 설정
+  dataset: nyu  # "nyu" 또는 "kitti"
+  split: train  # "train" 또는 "test"
+
+  # 경로 설정 - 전체 scene 처리 (추천)
+  base_dir: matched_dataset/nyu-depth-v2-matched/train  # 여러 scene 디렉토리를 포함하는 기본 디렉토리
+  out_base_dir: matched_dataset/nyu-processed-matched/train  # 출력 기본 디렉토리
+
+  # 단일 scene 처리 (base_dir이 설정되면 무시됨)
+  # image_dir: matched_dataset/nyu-depth-v2-matched/train/basement_0001a
+  # depth_dir: matched_dataset/nyu-depth-v2-matched/train/basement_0001a
+  # out_dir: matched_dataset/nyu-processed-matched/train/basement_0001a
+
+  # Depth 및 Text 설정
+  depth_dir: null  # null이면 base_dir과 동일한 경로 사용
+  text_dir: null  # 텍스트 caption 디렉토리 (선택사항, WorDepth 형식)
+
+  # SAM2 모델 설정
+  sam_ckpt: src/data_generation/sam2_b.pt  # SAM2 체크포인트 경로
+  sam_points_per_side: 8  # 그리드 포인트 수 (작을수록 가벼움, 기본값: 16)
+  sam_min_region_area: 500  # 최소 마스크 영역 (픽셀)
+  yolo_conf_thresh: 0.5  # YOLO confidence threshold (default: 0.5)
+  sam_max_objects: 15  # 최대 객체 수
+
+  # 관계 추론 설정
+  use_depth_gt: true  # GT depth 사용 (권장: true, 훨씬 빠르고 정확함)
+
+
+  # 하드웨어 설정
+  device: cuda:6  # "cuda", "cuda:0", "cpu"
+

@@ -13,6 +13,63 @@ import torchvision.transforms as transforms
 import platform
 
 
+# Global cache for relational annotations (relations.json)
+RELATIONS_CACHE = {}
+RELATIONS_CACHE_STATS = {'hits': 0, 'misses': 0}
+
+
+def preload_relations_cache(relations_base_path, filenames_file):
+    """
+    Preload all relations.json files into cache for faster training
+    
+    Args:
+        relations_base_path: path to relations directory
+        filenames_file: path to filenames file to know which files to preload
+    """
+    import os
+    import json
+    
+    print("Preloading relations cache...")
+    preloaded_count = 0
+    
+    # Read filenames to know which relations files to preload
+    with open(filenames_file, 'r') as f:
+        filenames = f.readlines()
+    
+    for filename in filenames:
+        filename = filename.strip()
+        if not filename:
+            continue
+            
+        # Parse filename to get scene and rgb name
+        parts = filename.split()
+        rgb_file = parts[0].lstrip('/')
+        
+        # Normalize to forward slash
+        rgb_file_unix = rgb_file.replace(os.sep, '/')
+        
+        # Construct scene name
+        scene_name = os.path.dirname(rgb_file_unix)
+        first_seg = scene_name.split('/', 1)[0]
+        if first_seg in ('train', 'test'):
+            scene_name = scene_name.split('/', 1)[1] if '/' in scene_name else ''
+        
+        rgb_basename = os.path.basename(rgb_file_unix).replace('.jpg', '').replace('.png', '')
+        rel_path = os.path.join(relations_base_path, scene_name, f"{rgb_basename}_relations.json")
+        
+        # Load into cache if not already loaded
+        if rel_path not in RELATIONS_CACHE and os.path.exists(rel_path):
+            try:
+                with open(rel_path, 'r') as f:
+                    RELATIONS_CACHE[rel_path] = json.load(f)
+                preloaded_count += 1
+            except Exception as e:
+                print(f"Warning: Failed to preload {rel_path}: {e}")
+    
+    print(f"Preloaded {preloaded_count} relations files into cache")
+    return preloaded_count
+
+
 class NYURelationalDataset(Dataset):
     """
     NYU-Depth-v2 with relational annotations (masks + relations)
@@ -359,8 +416,14 @@ class NYURelationalDataset(Dataset):
         
         # Load relations
         try:
-            with open(rel_path, 'r') as f:
-                relations = json.load(f)
+            global RELATIONS_CACHE, RELATIONS_CACHE_STATS
+            if rel_path not in RELATIONS_CACHE:
+                with open(rel_path, 'r') as f:
+                    RELATIONS_CACHE[rel_path] = json.load(f)
+                RELATIONS_CACHE_STATS['misses'] += 1
+            else:
+                RELATIONS_CACHE_STATS['hits'] += 1
+            relations = RELATIONS_CACHE[rel_path]
             
             # Filter out unsupported relations ('above' is not supported by RelationalDepthLoss)
             if relations is not None:
@@ -478,6 +541,7 @@ def create_nyu_relational_dataloader(args, mode='train'):
         shuffle=is_train,
         num_workers=num_workers,
         pin_memory=True,
+        persistent_workers=(num_workers > 0),
         collate_fn=collate_fn_with_relations if use_relational_loss else None
     )
     

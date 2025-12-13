@@ -32,6 +32,7 @@ class NewDataLoader(object):
                                    shuffle=(self.train_sampler is None),
                                    num_workers=args.num_threads,
                                    pin_memory=True,
+                                   persistent_workers=(args.num_threads > 0),
                                    sampler=self.train_sampler)
 
         elif mode == 'online_eval':
@@ -42,6 +43,7 @@ class NewDataLoader(object):
                                    shuffle=False,
                                    num_workers=1,
                                    pin_memory=True,
+                                   persistent_workers=True,
                                    sampler=self.eval_sampler)
 
         elif mode == 'test':

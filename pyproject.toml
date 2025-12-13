@@ -6,4 +6,6 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "setuptools>=80.9.0",
+    "ultralytics>=8.3.237",
+    "yoloworld>=0.0.1",
 ]
